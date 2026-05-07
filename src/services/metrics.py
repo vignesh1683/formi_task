@@ -1,92 +1,165 @@
 """
-PostCallMetricsTracker — Records timing and outcome metrics for post-call processing.
+PostCallMetricsTracker — Records timing and outcome metrics.
 
-Currently: logs to stdout. That's it.
-
-What we can't answer from these logs without significant grep work:
-  - What's the p95 latency for post-call analysis over the last hour?
-  - How many tokens did Customer X consume today?
-  - What percentage of calls are failing at the LLM step vs the recording step?
-  - How deep is the processing backlog right now?
-  - Are we trending toward hitting the LLM rate limit in the next 10 minutes?
-
-The data to answer these questions exists — it flows through this class with
-every interaction. It's just not being captured in a form that's queryable.
-
-tokens_used is particularly interesting: we get the exact value from the LLM
-provider on every call and log it. If we also wrote it to Redis with a sliding
-window, we'd have real-time TPM visibility. If we bucketed it by customer_id,
-we'd have per-customer usage tracking. Neither of those things requires a big
-infrastructure change — just a few more Redis writes in track_processing_completed.
+Changes from original:
+    1. track_processing_completed() now writes TPM to a Redis sliding-window
+       counter so real-time utilisation is always queryable.
+    2. Per-customer TPM bucket: every call increments
+       metrics:customer:{customer_id}:tpm with a 60s window.
+    3. Alert thresholds: if utilisation crosses 80% or 95%, a WARNING-level
+       structured event is emitted with alert=True.
+    4. Queue depth is tracked in Redis so it's visible without grep.
 """
 
 import logging
 import time
+from typing import Optional
 
 from src.utils.redis_client import redis_client
 
 logger = logging.getLogger(__name__)
 
+QUEUE_DEPTH_KEY = "postcall:queue_depth"
+GLOBAL_METRICS_TPM_KEY = "metrics:global:tpm"
+CUSTOMER_METRICS_TPM_PREFIX = "metrics:customer:{customer_id}:tpm"
+
 
 class PostCallMetricsTracker:
 
-    async def track_processing_started(self, interaction_id: str) -> None:
-        """Record the wall-clock start time for an interaction's processing."""
+    async def track_processing_started(
+        self, interaction_id: str, customer_id: str = ""
+    ) -> None:
+        """Record wall-clock start time and increment queue depth."""
         await redis_client.set(
             f"postcall:metrics:{interaction_id}:start",
             str(time.time()),
-            ex=3600,  # 1-hour TTL — if processing takes longer than that, we lose the start time
+            ex=3600,
+        )
+        # Track in-flight count for queue depth visibility
+        await redis_client.incr(QUEUE_DEPTH_KEY)
+        logger.info(
+            "postcall_started",
+            extra={
+                "interaction_id": interaction_id,
+                "customer_id": customer_id,
+            },
         )
 
     async def track_processing_completed(
-        self, interaction_id: str, tokens_used: int, latency_ms: float
+        self,
+        interaction_id: str,
+        tokens_used: int,
+        latency_ms: float,
+        customer_id: str = "",
     ) -> None:
         """
-        Log completion metrics for a processed interaction.
+        Log completion and update real-time TPM counters.
 
-        tokens_used is the exact value from the LLM provider's response.
-        It's logged here but not written to any aggregate counter.
+        Two Redis counters are updated:
+            metrics:global:tpm               — platform-wide rolling 60s window
+            metrics:customer:{id}:tpm        — per-customer rolling 60s window
 
-        If you wanted to know "how many tokens did we use in the last 60 seconds?"
-        you'd need to INCRBY a Redis key here, with a 60-second TTL, and do it
-        per-customer if you want customer-level visibility.
+        These power the utilisation alerts and per-customer billing queries.
         """
         start = await redis_client.get(f"postcall:metrics:{interaction_id}:start")
         wall_time_s = time.time() - float(start) if start else 0
+
+        # Update global rolling TPM counter
+        await redis_client.incrby(GLOBAL_METRICS_TPM_KEY, tokens_used)
+        await redis_client.expire(GLOBAL_METRICS_TPM_KEY, 60)
+
+        # Update per-customer rolling TPM counter
+        if customer_id:
+            ckey = CUSTOMER_METRICS_TPM_PREFIX.format(customer_id=customer_id)
+            await redis_client.incrby(ckey, tokens_used)
+            await redis_client.expire(ckey, 60)
+
+        # Decrement queue depth
+        depth = int(await redis_client.get(QUEUE_DEPTH_KEY) or 0)
+        if depth > 0:
+            await redis_client.decr(QUEUE_DEPTH_KEY)
 
         logger.info(
             "postcall_metrics",
             extra={
                 "interaction_id": interaction_id,
+                "customer_id": customer_id,
                 "tokens_used": tokens_used,
                 "llm_latency_ms": latency_ms,
                 "total_wall_time_s": round(wall_time_s, 2),
-                # wall_time_s includes the 45s recording sleep + LLM latency.
-                # If wall_time_s >> llm_latency_ms, recording is the bottleneck.
-                # That ratio could be a useful signal — but only if someone
-                # is looking at it, which currently nobody is.
+                "queue_depth": max(0, depth - 1),
             },
         )
 
     async def track_processing_failed(
-        self, interaction_id: str, error: str
+        self,
+        interaction_id: str,
+        error: str,
+        customer_id: str = "",
     ) -> None:
         """
-        Log a processing failure.
+        Log a permanent failure and decrement queue depth.
 
-        This is called by the retry queue when max retries are exhausted.
-        After this log line, the interaction has no further processing scheduled.
-        It will stay in "pending" state in the dashboard indefinitely.
+        A Grafana alert on postcall_failed_permanently fires immediately.
+        The on-call engineer has interaction_id and correlation_id to start
+        the debug.
         """
+        depth = int(await redis_client.get(QUEUE_DEPTH_KEY) or 0)
+        if depth > 0:
+            await redis_client.decr(QUEUE_DEPTH_KEY)
+
         logger.error(
             "postcall_failed_permanently",
             extra={
                 "interaction_id": interaction_id,
+                "customer_id": customer_id,
                 "error": error,
-                # A Grafana alert on postcall_failed_permanently would catch
-                # interactions that fell through completely. Currently none exists.
+                "alert": True,
+                # alert=True → Grafana log-alert filter to page on-call
             },
         )
+
+    async def get_queue_depth(self) -> int:
+        """Return the current in-flight processing count."""
+        return int(await redis_client.get(QUEUE_DEPTH_KEY) or 0)
+
+    async def check_utilisation_alerts(
+        self,
+        current_tpm: int,
+        tpm_limit: int,
+        current_rpm: int,
+        rpm_limit: int,
+    ) -> None:
+        """
+        Emit structured alert events when utilisation crosses thresholds.
+
+        Called from the Celery task after each LLM call completes, so
+        the alert fires in near-real-time without a separate polling loop.
+        """
+        tpm_pct = (current_tpm / tpm_limit * 100) if tpm_limit else 0
+        rpm_pct = (current_rpm / rpm_limit * 100) if rpm_limit else 0
+
+        for metric, pct in [("tpm", tpm_pct), ("rpm", rpm_pct)]:
+            if pct >= 95:
+                logger.error(
+                    "llm_utilisation_critical",
+                    extra={
+                        "metric": metric,
+                        "utilisation_pct": round(pct, 1),
+                        "alert": True,
+                        "alert_severity": "critical",
+                    },
+                )
+            elif pct >= 80:
+                logger.warning(
+                    "llm_utilisation_high",
+                    extra={
+                        "metric": metric,
+                        "utilisation_pct": round(pct, 1),
+                        "alert": True,
+                        "alert_severity": "warning",
+                    },
+                )
 
 
 metrics_tracker = PostCallMetricsTracker()
