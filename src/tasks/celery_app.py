@@ -6,6 +6,7 @@ celery_app = Celery(
     "voicebot",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
+    include=["src.tasks.celery_tasks"],
 )
 
 celery_app.conf.update(

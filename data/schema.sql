@@ -140,3 +140,140 @@ INSERT INTO interactions (id, session_id, lead_id, campaign_id, customer_id, age
         '{"transcript": [{"role": "agent", "content": "Hello—"}, {"role": "customer", "content": "Wrong number"}]}',
         '{"analysis_status": "pending"}'
     );
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NEW TABLES: Added as part of the scalable post-call pipeline redesign.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Durable task tracker. Replaces the Celery-only task tracking that is lost
+-- on Redis restarts. Every interaction that enters post-call processing gets
+-- a row here. Status transitions are the authoritative record of what happened.
+--
+-- Statuses: queued → processing → completed | failed | exhausted
+--   queued     : Celery task enqueued, not yet picked up by a worker
+--   processing : Worker has started processing
+--   completed  : All steps finished successfully
+--   failed     : One step failed, within retry budget
+--   exhausted  : Max retries consumed; needs manual intervention
+CREATE TABLE analysis_tasks (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID NOT NULL UNIQUE REFERENCES interactions(id) ON DELETE CASCADE,
+    customer_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+
+    -- Processing lane determines priority queue routing:
+    --   hot  : rebook_confirmed, demo_booked, escalation_needed → high-priority queue
+    --   cold : not_interested, callback_requested, already_done  → standard queue
+    --   skip : short_call (<4 turns)                            → no LLM, fast path
+    lane VARCHAR(10) NOT NULL DEFAULT 'cold' CHECK (lane IN ('hot', 'cold', 'skip')),
+
+    status VARCHAR(20) NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'processing', 'completed', 'failed', 'exhausted')),
+
+    -- Which Celery task is currently handling this interaction.
+    -- If the worker dies, we can detect orphaned tasks (no heartbeat for > N min).
+    celery_task_id VARCHAR(255),
+
+    -- Retry accounting
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 4,
+    last_error TEXT,
+    next_retry_at TIMESTAMPTZ,
+
+    -- Token usage — written back after each LLM call for budget tracking.
+    tokens_used INTEGER DEFAULT 0,
+
+    -- Correlation ID threaded from the inbound webhook through every step.
+    -- Lets an on-call engineer grep logs for a single interaction end-to-end.
+    correlation_id UUID NOT NULL DEFAULT uuid_generate_v4(),
+
+    -- Recording status tracked independently from LLM analysis
+    recording_status VARCHAR(20) DEFAULT 'pending'
+        CHECK (recording_status IN ('pending', 'uploaded', 'failed', 'skipped')),
+    recording_s3_key VARCHAR(512),
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_analysis_tasks_interaction ON analysis_tasks(interaction_id);
+CREATE INDEX idx_analysis_tasks_customer ON analysis_tasks(customer_id);
+CREATE INDEX idx_analysis_tasks_status ON analysis_tasks(status);
+CREATE INDEX idx_analysis_tasks_lane_status ON analysis_tasks(lane, status);
+CREATE INDEX idx_analysis_tasks_correlation ON analysis_tasks(correlation_id);
+CREATE INDEX idx_analysis_tasks_next_retry ON analysis_tasks(next_retry_at)
+    WHERE status = 'failed';
+
+
+-- Per-customer token budget configuration and real-time usage tracking.
+--
+-- Allocation model:
+--   allocated_tpm  : Pre-reserved tokens/min for this customer (guaranteed floor)
+--   burst_factor   : Multiplier over allocation when global headroom exists
+--   used_tpm_current : Rolling 60-second window counter (written by budget_manager)
+--
+-- A customer with allocated_tpm=20 always gets ≥20 TPM even if others are active.
+-- Unallocated headroom (global_tpm − sum(allocated_tpm)) is shared fairly among
+-- customers that want to burst above their allocation.
+CREATE TABLE customer_quotas (
+    customer_id UUID PRIMARY KEY,
+
+    -- Token budget
+    allocated_tpm INTEGER NOT NULL DEFAULT 1000,  -- guaranteed tokens per minute
+    burst_factor FLOAT NOT NULL DEFAULT 1.5,      -- max burst = allocated_tpm × burst_factor
+    daily_token_limit BIGINT,                     -- optional hard cap; NULL = unlimited
+
+    -- Priority within the hot lane when multiple customers compete
+    priority_tier INTEGER NOT NULL DEFAULT 2      -- 1=highest, 3=lowest
+        CHECK (priority_tier BETWEEN 1 AND 3),
+
+    -- Processing preferences (no deployment needed to change per-customer behaviour)
+    skip_llm_on_short_calls BOOLEAN NOT NULL DEFAULT TRUE,
+    short_call_threshold INTEGER NOT NULL DEFAULT 4,   -- turns
+    enable_crm_push BOOLEAN NOT NULL DEFAULT FALSE,
+    crm_webhook_url TEXT,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Seed default quota rows for the test customer IDs used in fixtures
+INSERT INTO customer_quotas (customer_id, allocated_tpm, burst_factor, priority_tier) VALUES
+    ('d0000000-0000-0000-0000-000000000001', 2000, 1.5, 1),
+    ('d0000000-0000-0000-0000-000000000002', 1000, 1.2, 2);
+
+
+-- Structured audit log — one row per stage-transition per interaction.
+-- Every step in the pipeline (enqueue, triage, rate_limit_wait, llm_call,
+-- recording_upload, signal_job, lead_stage_update) writes a row here.
+--
+-- This makes it possible to answer "what happened to interaction X at 2am on Tuesday?"
+-- without relying on log aggregation.
+CREATE TABLE interaction_audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    interaction_id UUID NOT NULL REFERENCES interactions(id) ON DELETE CASCADE,
+    correlation_id UUID NOT NULL,
+    customer_id UUID NOT NULL,
+
+    -- Which pipeline step emitted this event
+    stage VARCHAR(50) NOT NULL,
+    -- e.g.: webhook_received, triage, rate_limit_wait, llm_call_start,
+    --       llm_call_end, recording_poll_attempt, recording_uploaded,
+    --       recording_failed, signal_job_triggered, lead_stage_updated,
+    --       task_failed, task_completed
+
+    status VARCHAR(20) NOT NULL CHECK (status IN ('started', 'completed', 'failed', 'skipped')),
+
+    -- Stage-specific payload (token counts, retry attempts, error details, etc.)
+    metadata JSONB DEFAULT '{}',
+
+    -- Wall-clock duration of this stage (NULL if event is a point-in-time marker)
+    duration_ms INTEGER,
+
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_log_interaction ON interaction_audit_log(interaction_id);
+CREATE INDEX idx_audit_log_correlation ON interaction_audit_log(correlation_id);
+CREATE INDEX idx_audit_log_customer_created ON interaction_audit_log(customer_id, created_at);
+CREATE INDEX idx_audit_log_stage_status ON interaction_audit_log(stage, status);
