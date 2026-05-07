@@ -31,7 +31,9 @@ async def test_every_call_gets_full_llm_analysis(make_post_call_context):
         }
 
         with patch.object(processor, "_update_interaction_metadata", new_callable=AsyncMock):
-            result = await processor.process_post_call(ctx)
+            with patch("src.services.post_call_processor.budget_manager.check_and_consume", new_callable=AsyncMock) as mock_budget:
+                mock_budget.return_value = MagicMock(allowed=True)
+                result = await processor.process_post_call(ctx)
 
         # LLM was called — even though the transcript clearly says "not interested"
         mock_llm.assert_called_once()

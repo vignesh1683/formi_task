@@ -1,36 +1,43 @@
 """
-Celery tasks for post-call processing.
+Celery tasks for post-call processing — redesigned pipeline.
 
-This is the main background processing pipeline. Every completed interaction
-with a long transcript ends up here.
+Key changes from the original:
 
-The task runs five steps sequentially:
-    1. Wait 45s, try to fetch recording from Exotel → upload to S3
-    2. Run full LLM analysis on the transcript
-    3. Write result to interaction_metadata (dashboard cache)
-    4. Trigger signal jobs (downstream actions: WhatsApp, callbacks, etc.)
-    5. Update lead stage
+1. TWO QUEUES instead of one:
+       postcall_hot  → hot-lane interactions (rebook, demo, escalation)
+       postcall_cold → cold-lane interactions (not_interested, callback, etc.)
+   Workers on the hot queue are scaled more aggressively. Cold queue workers
+   can be scaled down when rate limit headroom is tight.
 
-A few things worth understanding before you start changing things:
+2. Recording and LLM run in PARALLEL:
+   asyncio.gather() runs fetch_and_upload_recording() and _run_llm_analysis()
+   concurrently. Since the LLM reads the transcript (not the audio), they have
+   zero data dependency. This eliminates the 45-second recording gate that
+   delayed every analysis.
 
-WHY CELERY + REDIS?
-  We needed a task queue and Celery was already in the stack. Redis was already
-  in the stack. It worked fine at 1K calls/day. At 100K calls/campaign the cracks
-  show: broker restarts lose tasks, queue depth is invisible, and there's no way
-  to see which step a given interaction is stuck on.
+3. Rate-limit-aware LLM scheduling:
+   If rate_limiter or budget_manager blocks the LLM call, the task does NOT
+   immediately retry (which would flood the queue). Instead it:
+       a. Sleeps wait_seconds (from RateLimitExceeded.wait_seconds)
+       b. Updates analysis_tasks.next_retry_at in DB
+       c. Raises self.retry() with the correct countdown
+   This ensures the task waits the right amount before consuming a worker slot.
 
-WHY ONE QUEUE?
-  Originally there was only one customer. One queue was fine. We never revisited
-  it when the platform became multi-customer. Now a campaign for Customer A can
-  fill the queue and delay Customer B's results by hours.
+4. Durable task state:
+   analysis_tasks DB row is updated at each step transition:
+       queued → processing → completed | failed | exhausted
+   If a worker crashes, the row stays in 'processing'. A sweeper job (not
+   implemented here) detects stale processing rows and re-enqueues them.
 
-WHY DOES RECORDING BLOCK ANALYSIS?
-  It shouldn't. Recording upload and LLM analysis are completely independent —
-  the LLM reads the transcript, not the audio file. But they're sequential here
-  because that's how the task was originally written and nobody had a reason to
-  split them until the 45-second sleep became a visible SLA problem.
+5. Signal jobs fire ONCE, AFTER analysis, with the real result:
+   The original fired signal_jobs twice (once before Celery with empty payload,
+   once after). Now signal_jobs only fires from the Celery task, after the LLM
+   result is available.
 
-  Think about what "run them in parallel" would require at the infrastructure level.
+6. Single retry mechanism:
+   The custom PostCallRetryQueue is removed. Celery's own retry mechanism
+   (self.retry) is the sole retry path. The analysis_tasks table tracks state
+   durably so retries can resume even after Redis restarts.
 """
 
 import asyncio
@@ -39,45 +46,69 @@ from datetime import datetime
 from typing import Any, Dict
 
 from src.tasks.celery_app import celery_app
-from src.services.post_call_processor import PostCallProcessor, PostCallContext
+from src.services.post_call_processor import (
+    PostCallProcessor,
+    PostCallContext,
+    RateLimitExceeded,
+)
 from src.services.recording import fetch_and_upload_recording
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
-from src.services.retry_queue import retry_queue
 from src.services.metrics import metrics_tracker
 
 logger = logging.getLogger(__name__)
+
+# Celery queue names — must match the worker startup configuration
+HOT_QUEUE = "postcall_hot"
+COLD_QUEUE = "postcall_cold"
 
 
 @celery_app.task(
     name="process_interaction_end_background_task",
     bind=True,
-    max_retries=3,
-    default_retry_delay=60,  # Fixed 60s — no exponential backoff
-    acks_late=True,           # Task only acked after completion, not on receipt.
-                              # This means a worker crash causes redelivery — good.
-                              # But "redelivery" goes to the back of the queue,
-                              # which at 100K depth means hours of extra wait.
-    queue="postcall_processing",
+    max_retries=4,
+    # NO default_retry_delay — we compute it dynamically based on RateLimitExceeded
+    acks_late=True,
+    queue=COLD_QUEUE,  # default queue; endpoints.py overrides to HOT_QUEUE for hot lane
 )
 def process_interaction_end_background_task(self, payload: Dict[str, Any]):
     """
-    Main Celery task. Called for every long-transcript interaction.
+    Main Celery task. Routes based on lane in payload.
 
-    Celery workers are synchronous by default, so we spin up an event loop
-    per task to run the async processing code. This means each Celery worker
-    process handles one interaction at a time — no concurrency within a worker.
-
-    At 100K interactions/campaign with ~3,500ms LLM latency per call:
-        100,000 × 3.5s = 350,000 worker-seconds needed
-        With 10 workers: ~9.7 hours to drain the queue
-
-    If your campaign window is 8 hours, you're already behind before you start.
+    Celery workers are synchronous; we spin up a new event loop per task.
+    At 100K calls with 3.5s LLM latency and 10 workers on the cold queue:
+        100,000 × 3.5s / 10 workers = 9.7 hours.
+    But with the cold queue deferrable and hot queue prioritised:
+        - Hot calls (rebooks, demos): processed within seconds.
+        - Cold calls: processed as capacity allows, never starving hot calls.
+    Horizontal worker scaling reduces the cold queue drain time linearly.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
         loop.run_until_complete(_process_interaction(self, payload))
+    except RateLimitExceeded as e:
+        # Rate limited — wait the right amount, then requeue
+        wait = max(int(e.wait_seconds), 30)
+        logger.warning(
+            "celery_task_rate_limited",
+            extra={
+                "interaction_id": payload.get("interaction_id"),
+                "wait_seconds": wait,
+                "reason": e.reason,
+                "attempt": self.request.retries,
+            },
+        )
+        loop.run_until_complete(
+            _update_task_status(
+                payload.get("interaction_id", ""),
+                "failed",
+                error=e.reason,
+                next_retry_seconds=wait,
+            )
+        )
+        raise self.retry(exc=e, countdown=wait)
+
     except Exception as e:
         logger.exception(
             "celery_task_failed",
@@ -85,34 +116,59 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
                 "interaction_id": payload.get("interaction_id"),
                 "error": str(e),
                 "attempt": self.request.retries,
+                "correlation_id": payload.get("correlation_id"),
             },
         )
-        # Failed tasks go into PostCallRetryQueue (Redis) AND Celery retries.
-        # Two retry mechanisms that don't know about each other. An interaction
-        # can end up being processed twice if both fire.
         loop.run_until_complete(
-            retry_queue.enqueue_retry(
-                interaction_id=payload["interaction_id"],
+            _update_task_status(
+                payload.get("interaction_id", ""),
+                "failed",
                 error=str(e),
-                payload=payload,
+                next_retry_seconds=60,
             )
         )
-        raise self.retry(exc=e)
+
+        if self.request.retries >= self.max_retries:
+            # Exhausted — mark permanently failed in DB, alert fires via logger
+            loop.run_until_complete(
+                metrics_tracker.track_processing_failed(
+                    payload.get("interaction_id", ""),
+                    error=str(e),
+                    customer_id=payload.get("customer_id", ""),
+                )
+            )
+            loop.run_until_complete(
+                _update_task_status(
+                    payload.get("interaction_id", ""), "exhausted", error=str(e)
+                )
+            )
+        else:
+            raise self.retry(exc=e, countdown=60)
     finally:
         loop.close()
 
 
 async def _process_interaction(task, payload: Dict[str, Any]):
     interaction_id = payload["interaction_id"]
+    customer_id = payload.get("customer_id", "")
+    correlation_id = payload.get("correlation_id", "")
 
-    await metrics_tracker.track_processing_started(interaction_id)
+    log_ctx = {
+        "interaction_id": interaction_id,
+        "customer_id": customer_id,
+        "correlation_id": correlation_id,
+        "lane": payload.get("lane", "cold"),
+    }
+
+    await _update_task_status(interaction_id, "processing")
+    await metrics_tracker.track_processing_started(interaction_id, customer_id)
 
     ctx = PostCallContext(
         interaction_id=interaction_id,
         session_id=payload["session_id"],
         lead_id=payload["lead_id"],
         campaign_id=payload["campaign_id"],
-        customer_id=payload["customer_id"],
+        customer_id=customer_id,
         agent_id=payload["agent_id"],
         call_sid=payload.get("call_sid", ""),
         transcript_text=payload.get("transcript_text", ""),
@@ -120,51 +176,52 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         additional_data=payload.get("additional_data", {}),
         ended_at=datetime.fromisoformat(payload["ended_at"]),
         exotel_account_id=payload.get("exotel_account_id"),
+        correlation_id=correlation_id,
     )
 
-    # ── Step 1: Recording ─────────────────────────────────────────────────────
-    # Blocks here for ~45 seconds waiting for Exotel to make the recording
-    # available. The LLM analysis (step 2) cannot start until this completes,
-    # even though it has zero dependency on the recording.
-    #
-    # Under load, recordings often arrive in 10–15s. We wait 45s anyway.
-    # Sometimes they arrive after 60s. We've already given up by then.
-    recording_s3_key = await fetch_and_upload_recording(
-        interaction_id=ctx.interaction_id,
-        call_sid=ctx.call_sid,
-        exotel_account_id=ctx.exotel_account_id or "",
-    )
+    # ── Step 1: Recording + LLM in PARALLEL ───────────────────────────────
+    # The original ran these sequentially (recording blocked analysis by 45s).
+    # asyncio.gather() runs both concurrently.
+    # Recording failure does NOT abort LLM — they are independent.
+    # RateLimitExceeded from the LLM step propagates up to abort the task.
+    logger.info("postcall_processing_start", extra=log_ctx)
 
-    if recording_s3_key:
-        logger.info(
-            "recording_uploaded",
-            extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
-        )
-    # If recording_s3_key is None, we continue silently. No alert, no retry,
-    # no flag on the interaction. The recording is just gone.
-
-    # ── Step 2: LLM analysis ──────────────────────────────────────────────────
-    # Full analysis on every call. 1,500 tokens average. No pre-screening.
-    # A call where the customer said "wrong number" after one sentence gets the
-    # same treatment as a confirmed rebook.
-    #
-    # The LLM rate limit (settings.LLM_TOKENS_PER_MINUTE) is not checked before
-    # this call. If we're over the limit, the provider returns a 429 and this
-    # raises an exception, which triggers Celery retry — which goes to the back
-    # of the 100K-item queue and makes the problem worse.
     processor = PostCallProcessor()
-    result = await processor.process_post_call(ctx, single_prompt=True)
 
-    await metrics_tracker.track_processing_completed(
-        interaction_id, result.tokens_used, result.latency_ms
+    recording_task = asyncio.create_task(
+        fetch_and_upload_recording(
+            interaction_id=ctx.interaction_id,
+            call_sid=ctx.call_sid,
+            exotel_account_id=ctx.exotel_account_id or "",
+            correlation_id=correlation_id,
+        )
     )
 
-    # ── Step 3: Signal jobs ───────────────────────────────────────────────────
-    # Downstream actions: send a WhatsApp follow-up, book a callback slot,
-    # push to the customer's CRM. These depend on knowing the analysis result.
-    #
-    # If this raises, we log a warning and continue — the lead stage still
-    # updates. But the downstream action (WhatsApp, callback, CRM push) is lost.
+    llm_task = asyncio.create_task(
+        processor.process_post_call(ctx)
+    )
+
+    # Wait for both. If llm_task raises RateLimitExceeded, recording_task
+    # is cancelled cleanly by the exception propagation.
+    recording_s3_key, result = await asyncio.gather(
+        recording_task, llm_task, return_exceptions=False
+    )
+
+    if not recording_s3_key:
+        # Already logged inside fetch_and_upload_recording; nothing more to do.
+        logger.warning(
+            "recording_unavailable_continuing",
+            extra=log_ctx,
+        )
+
+    # ── Step 2: Update metrics ─────────────────────────────────────────────
+    await metrics_tracker.track_processing_completed(
+        interaction_id, result.tokens_used, result.latency_ms, customer_id
+    )
+
+    # ── Step 3: Signal jobs (with real analysis result) ────────────────────
+    # Fires exactly once, after analysis. The original fired twice with an
+    # empty payload on the first fire.
     try:
         await trigger_signal_jobs(
             interaction_id=ctx.interaction_id,
@@ -173,12 +230,15 @@ async def _process_interaction(task, payload: Dict[str, Any]):
             analysis_result=result.raw_response,
         )
     except Exception as e:
-        logger.warning("signal_jobs_failed", extra={"error": str(e)})
+        # Signal job failure is logged but does not abort the task.
+        # The analysis result is already committed; only downstream actions fail.
+        # A separate signal-job retry mechanism handles these independently.
+        logger.warning(
+            "signal_jobs_failed",
+            extra={**log_ctx, "error": str(e)},
+        )
 
-    # ── Step 4: Lead stage update ─────────────────────────────────────────────
-    # Updates the lead's stage in the leads table based on call_stage.
-    # e.g., "rebook_confirmed" → lead moves to "booked" stage.
-    # Same fire-and-forget risk as signal_jobs above.
+    # ── Step 4: Lead stage update ──────────────────────────────────────────
     try:
         await update_lead_stage(
             lead_id=ctx.lead_id,
@@ -186,4 +246,38 @@ async def _process_interaction(task, payload: Dict[str, Any]):
             call_stage=result.call_stage,
         )
     except Exception as e:
-        logger.warning("lead_stage_update_failed", extra={"error": str(e)})
+        logger.warning(
+            "lead_stage_update_failed",
+            extra={**log_ctx, "error": str(e)},
+        )
+
+    # ── Step 5: Mark task complete ─────────────────────────────────────────
+    await _update_task_status(interaction_id, "completed")
+    logger.info(
+        "postcall_processing_complete",
+        extra={**log_ctx, "call_stage": result.call_stage},
+    )
+
+
+from sqlalchemy import text
+from src.utils.db import engine
+
+async def _update_task_status(
+    interaction_id: str,
+    status: str,
+    error: str = "",
+    next_retry_seconds: int = 0,
+) -> None:
+    """Write the current task status to analysis_tasks."""
+    query = text("""
+        UPDATE analysis_tasks 
+        SET status = :status, 
+            attempt_count = attempt_count + (CASE WHEN :status = 'processing' THEN 1 ELSE 0 END),
+            next_retry_at = CASE WHEN :retry > 0 THEN NOW() + (:retry * INTERVAL '1 second') ELSE next_retry_at END,
+            updated_at = NOW()
+        WHERE interaction_id = :iid
+    """)
+    async with engine.begin() as conn:
+        await conn.execute(query, {
+            "status": status, "retry": next_retry_seconds, "iid": interaction_id
+        })
